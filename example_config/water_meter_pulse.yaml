@@ -1,0 +1,183 @@
+# Beispielkonfiguration für einen ESPHome-Firmware zur Messung des aktuellen
+# Wasserverbrauchs und des Gesamtverbrauchs mittels eines Wasserzählers mit
+# Pulsausgang (1 Puls = 10 Liter)
+
+# Allgemeine Konfiguration (anzupassen)
+esphome:
+  name: water-meter
+  friendly_name: Wasserzähler
+  project:
+    name: custom.water_meter
+    version: 1.0.0
+
+# Beispiel ESP8266 Firmware (kann durch entsprechende Konfiguration ersetzt werden)
+esp8266:
+  board: esp01_1m
+
+# Logging aktivieren (optional)
+logger:
+  level: INFO
+
+# Home Assistant API aktivieren (erforderlich bei Verwendung mit Home Assistant, alternativ MQTT konfigurieren)
+api:
+  encryption:
+    key: !secret ha_api_key
+
+# Over-the-Air Updates aktivieren (empfohlen)
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# Wi-Fi aktivieren (erforderlich)
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Fallback Hotspot (Captive Portal) aktivieren, falls Wi-Fi-Verbindung fehlschlägt
+  ap:
+    ssid: Water Meter Fallback Hotspot
+    password: !secret fallback_hs_password
+
+# Benötigt für Fallback Hotspot (siehe oben)
+captive_portal:
+
+# Globale Variablen für Wasserzähler
+globals:
+  # Zählerstand in Kubikmetern (m³)
+  - id: water_volume_total
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  # Letzte Zeit für Durchflussberechnung
+  - id: last_pulse_time
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+
+# Puls-Eingang für Wasserzähler
+binary_sensor:
+  # Wasserzähler Puls-Sensor
+  - platform: gpio
+    id: water_pulse
+    pin:
+      number: GPIO4  # GPIO-Pin des ESP8266
+      mode:
+        input: true
+        pullup: true
+    filters:
+      # Entprellung - verhindert Mehrfachzählung bei einem Puls
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      then:
+        # Bei jedem Puls wird der Zählerstand um 10 Liter (0.01 m³) erhöht
+        - lambda: |-
+            // Aktuellen Zählerstand um 0.01 m³ (10 Liter) erhöhen
+            id(water_volume_total) += 0.01;
+            
+            // Zeitstempel für Durchflussberechnung
+            unsigned long current_time = millis();
+            unsigned long time_diff = current_time - id(last_pulse_time);
+            
+            // Durchfluss berechnen (nur wenn vorheriger Puls vorhanden)
+            if (id(last_pulse_time) > 0 && time_diff > 0) {
+              // 0.01 m³ pro Puls, time_diff in ms -> m³/h
+              float flow_rate = (0.01 * 3600000.0) / time_diff;
+              id(water_flow).publish_state(flow_rate);
+            }
+            
+            id(last_pulse_time) = current_time;
+            
+            // Zählerstand aktualisieren
+            id(water_meter).publish_state(id(water_volume_total));
+            
+            ESP_LOGD("water_meter", "Puls erkannt - Zählerstand: %.3f m³", id(water_volume_total));
+  
+  # Diagnostischer Sensor für WLAN-Verbindungsstatus
+  - platform: status
+    name: Status
+
+# Numerische Sensoren
+sensor:
+  # Sensor für momentanen Wasserdurchfluss (Kubikmeter pro Stunde)
+  - platform: template
+    id: water_flow
+    name: Wasserdurchfluss
+    icon: mdi:water-pump
+    unit_of_measurement: "m³/h"
+    accuracy_decimals: 2
+    state_class: measurement
+    device_class: volume_flow_rate
+    # Nach 5 Minuten ohne Puls -> Durchfluss auf 0 setzen
+    filters:
+      - timeout: 300s
+        value: 0.0
+  
+  # Sensor für Gesamtwasserverbrauch (Zählerstand)
+  - platform: template
+    id: water_meter
+    name: Wasserzählerstand
+    icon: mdi:counter
+    unit_of_measurement: "m³"
+    accuracy_decimals: 3
+    state_class: total_increasing
+    device_class: water
+  
+  # Sensor für Wi-Fi Signalstärke
+  - platform: wifi_signal
+    name: Wi-Fi Signal
+    update_interval: 60s
+
+# Text Sensoren
+text_sensor:
+  - platform: wifi_info
+    # Diagnostischer Sensor für IP-Adresse des ESP-Mikrocontrollers
+    ip_address:
+      name: IP Adresse
+
+# Zahlen-Komponenten
+number:
+  # Importiere Entität mit letztem Zählerstand aus Home Assistant
+  - platform: homeassistant
+    id: last_water_value
+    entity_id: input_number.wasserzaehler_letzter_wert
+    on_value:
+      then:
+        - lambda: |-
+            // Beim Start den gespeicherten Wert aus Home Assistant laden
+            if (x >= 0) {
+              id(water_volume_total) = x;
+              id(water_meter).publish_state(x);
+              ESP_LOGI("water_meter", "Zählerstand wiederhergestellt: %.3f m³", x);
+            }
+  
+  # Zahl für manuelles Überschreiben des Zählerstands
+  - platform: template
+    id: target_water_value
+    name: Manueller Zählerstand
+    icon: mdi:counter
+    unit_of_measurement: m³
+    device_class: water
+    entity_category: config
+    mode: box
+    optimistic: true
+    min_value: 0
+    max_value: 10000
+    step: 0.01
+
+# Button-Komponenten
+button:
+  # Button zum manuellen Überschreiben des Zählerstands
+  - platform: template
+    name: Wasserzählerstand überschreiben
+    icon: mdi:download
+    entity_category: config
+    on_press:
+      - lambda: |-
+          float val = id(target_water_value).state;
+          if (val >= 0) {
+            id(water_volume_total) = val;
+            id(water_meter).publish_state(val);
+            id(last_pulse_time) = 0;
+            ESP_LOGI("water_meter", "Zählerstand manuell gesetzt: %.3f m³", val);
+          }
