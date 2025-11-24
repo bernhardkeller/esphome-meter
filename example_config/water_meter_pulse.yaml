@@ -43,11 +43,11 @@ captive_portal:
 
 # Globale Variablen für Wasserzähler
 globals:
-  # Zählerstand in Kubikmetern (m³)
-  - id: water_volume_total
-    type: float
+  # Zählerstand in Litern (intern ganzzahlig)
+  - id: water_volume_total_liters
+    type: int64_t
     restore_value: no
-    initial_value: '0.0'
+    initial_value: '0'
   # Letzte Zeit für Durchflussberechnung
   - id: last_pulse_time
     type: unsigned long
@@ -70,10 +70,10 @@ binary_sensor:
       - delayed_off: 50ms
     on_press:
       then:
-        # Bei jedem Puls wird der Zählerstand um 10 Liter (0.01 m³) erhöht
+        # Bei jedem Puls wird der Zählerstand um 10 Liter erhöht
         - lambda: |-
-            // Aktuellen Zählerstand um 0.01 m³ (10 Liter) erhöhen
-            id(water_volume_total) += 0.01;
+            // Aktuellen Zählerstand um 10 Liter erhöhen (ganzzahlig)
+            id(water_volume_total_liters) += 10;
             
             // Zeitstempel für Durchflussberechnung
             unsigned long current_time = millis();
@@ -81,17 +81,19 @@ binary_sensor:
             
             // Durchfluss berechnen (nur wenn vorheriger Puls vorhanden)
             if (id(last_pulse_time) > 0 && time_diff > 0) {
-              // 0.01 m³ pro Puls, time_diff in ms -> m³/h
-              float flow_rate = (0.01 * 3600000.0) / time_diff;
+              // 10 Liter pro Puls, time_diff in ms -> m³/h
+              // Ganzzahlig: (10 * 3600000) / time_diff / 1000 = 36000 / time_diff
+              float flow_rate = 36000.0f / time_diff;
               id(water_flow).publish_state(flow_rate);
             }
             
             id(last_pulse_time) = current_time;
             
-            // Zählerstand aktualisieren
-            id(water_meter).publish_state(id(water_volume_total));
+            // Zählerstand aktualisieren (Umwandlung Liter -> m³)
+            float volume_m3 = id(water_volume_total_liters) / 1000.0f;
+            id(water_meter).publish_state(volume_m3);
             
-            ESP_LOGD("water_meter", "Puls erkannt - Zählerstand: %.3f m³", id(water_volume_total));
+            ESP_LOGD("water_meter", "Puls erkannt - Zählerstand: %lld L (%.3f m³)", id(water_volume_total_liters), volume_m3);
   
   # Diagnostischer Sensor für WLAN-Verbindungsstatus
   - platform: status
@@ -144,11 +146,11 @@ number:
     on_value:
       then:
         - lambda: |-
-            // Beim Start den gespeicherten Wert aus Home Assistant laden
+            // Beim Start den gespeicherten Wert aus Home Assistant laden (m³ -> Liter)
             if (x >= 0) {
-              id(water_volume_total) = x;
+              id(water_volume_total_liters) = (int64_t)(x * 1000.0f);
               id(water_meter).publish_state(x);
-              ESP_LOGI("water_meter", "Zählerstand wiederhergestellt: %.3f m³", x);
+              ESP_LOGI("water_meter", "Zählerstand wiederhergestellt: %lld L (%.3f m³)", id(water_volume_total_liters), x);
             }
   
   # Zahl für manuelles Überschreiben des Zählerstands
@@ -176,8 +178,8 @@ button:
       - lambda: |-
           float val = id(target_water_value).state;
           if (val >= 0) {
-            id(water_volume_total) = val;
+            id(water_volume_total_liters) = (int64_t)(val * 1000.0f);
             id(water_meter).publish_state(val);
             id(last_pulse_time) = 0;
-            ESP_LOGI("water_meter", "Zählerstand manuell gesetzt: %.3f m³", val);
+            ESP_LOGI("water_meter", "Zählerstand manuell gesetzt: %lld L (%.3f m³)", id(water_volume_total_liters), val);
           }
